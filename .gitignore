@@ -1,0 +1,29 @@
+# Local builds
+/target/
+/linux-host/rust-backend/target/
+/linux-host/xdisplay-backend
+/linux-host/vkms-probe
+/linux-host/vkms-read
+/linux-host/turbo-jpeg
+__pycache__/
+*.py[cod]
+
+# Private working material and device recordings
+/analysis/
+/artifacts/
+*.dmg
+*.exe
+*.msi
+*.dll
+*.ipa
+*.pkg
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.zip
+*.pcap*
+*.log
+*.jsonl
+.env
+.env.*
