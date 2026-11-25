@@ -191,6 +191,24 @@ impl Source {
         self.root = root.into();
         Ok(())
     }
+    pub(crate) async fn start_brokered(
+        &mut self,
+        root: &Path,
+        stop: &Stop,
+        broker: &mut crate::reader_broker::ReaderBroker,
+    ) -> Result<()> {
+        ensure!(
+            self.raw.is_none() && !self.failed,
+            "source already started/failed"
+        );
+        self.raw = Some(
+            broker
+                .open(&self.settings.device, self.settings.connector, stop)
+                .await?,
+        );
+        self.root = root.into();
+        Ok(())
+    }
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -253,12 +271,12 @@ impl Source {
         let measure = self.settings.socket_timing && self.encoded > 0;
         let operation = async {
             let requested = measure.then(Instant::now);
-            self.request
-                .as_mut()
-                .context("missing frame helper")?
-                .write_all(b"F")
-                .await?;
             let raw = self.raw.as_mut().context("missing raw socket")?;
+            if let Some(request) = self.request.as_mut() {
+                request.write_all(b"F").await?;
+            } else {
+                raw.write_all(b"F").await?;
+            }
             let mut header = [0; 16];
             raw.read_exact(&mut header).await?;
             validate_raw_header(&header, width, height)?;

@@ -26,7 +26,7 @@ PHASES = {
     'preparing': ('准备虚拟画面', '仅读取选定 VKMS 输出。权限确认和准备可能需要一些时间。'),
     'waiting': ('等待 iPad App', '请打开官方 Wired XDisplay App。发现 USB 设备不代表握手已完成。'),
     'sending': ('主机正在发送', '下方是主机发送统计，不代表 iPad 显示帧率或端到端延迟。'),
-    'cleaning': ('正在清理', '等待编码器与读取器退出；权限子进程清理可能需要约 135 秒。'),
+    'cleaning': ('正在清理', '正在释放采集和编码资源；退出时也会关闭授权助手。'),
 }
 
 
@@ -47,6 +47,9 @@ class PanelWindow(Adw.ApplicationWindow):
         self.tray_reason = '正在检查系统托盘…'
         self.had_error = False
         self.clean = False
+        self.owned_output = None
+        self.output_cleanup_running = False
+        self.cleanup_after_child = False
         self.lines = deque(maxlen=60)
 
         toolbar = Adw.ToolbarView()
@@ -148,7 +151,8 @@ class PanelWindow(Adw.ApplicationWindow):
 
         advanced = Adw.PreferencesGroup(title='安全与限制')
         self.elevate = Adw.SwitchRow(title='临时授权 VKMS 读取器',
-                                    subtitle='默认关闭；只通过系统授权运行有界 C 读取器，GTK 界面和 Rust 后端均不提权。')
+                                    subtitle='默认开启，仍需系统授权；GTK 界面和 Rust 后端均不提权。')
+        self.elevate.set_active(True)
         advanced.add(self.elevate)
         limit = Adw.ActionRow(title='开发版有界测试', subtitle='每次最多 300 帧或 15 秒会话；准备及清理时间另计。')
         advanced.add(limit)
@@ -347,7 +351,7 @@ class PanelWindow(Adw.ApplicationWindow):
                    'Rust 后端和 GTK 界面不以 root 运行。新建或原先关闭的虚拟输出设置为 '
                    '2360×1640 / 60Hz / 缩放 1.5 / 正常方向。\n\n'
                    '不针对物理屏幕执行设置、不保存开机配置、不开始采集或传屏。'
-                   '取消或失败不会自动卸载已加载的模块或撤销已启用的输出。',
+                   '投屏结束或明确退出时关闭本程序启用的虚拟屏；不会卸载模块。',
             buttons=['取消', '创建／启用'], cancel_button=0, default_button=0)
         def answered(obj, result):
             self.confirming = False
@@ -438,6 +442,7 @@ class PanelWindow(Adw.ApplicationWindow):
                     else:
                         self.diagnostic_used = True
                         self.controller.start_diagnostic(settings, self.diagnostic_dir)
+                    self.cleanup_after_child = True
             except GLib.Error:
                 pass
             except Exception as exc:
@@ -460,7 +465,19 @@ class PanelWindow(Adw.ApplicationWindow):
                     'diagnostic_config', 'diagnostic_sent', 'diagnostic_saved', 'diagnostic_cursor_stage', 'error',
                     'metrics', 'cleanup', 'finished', 'stopped', 'process_exit'):
                 print(json.dumps(event, ensure_ascii=False), flush=True)
-            if kind == 'inventory':
+            if kind == 'output_owned':
+                self.owned_output = event
+            elif kind == 'output_cleaned':
+                if self.output_cleanup_running and self.owned_output is not None:
+                    owner = self.owned_output
+                    self.outputs = [row for row in self.outputs if
+                                    (row['device'], row['connector']) != (owner['device'], owner['connector'])]
+                    self.output_row.set_model(Gtk.StringList.new([
+                        f'{row["width"]} × {row["height"]} · {row["device"].split("/")[-1]} / {row["connector"]}'
+                        for row in self.outputs] or ['未发现可用 VKMS 输出']))
+                    self.owned_output = None
+                self.log('本程序启用的 VKMS 输出已清理')
+            elif kind == 'inventory':
                 self.apply_inventory(event)
             elif kind == 'output_setup':
                 self.status.set_label('正在设置虚拟输出')
@@ -506,6 +523,11 @@ class PanelWindow(Adw.ApplicationWindow):
                     self.description.set_label('后端已结束；画面是否正常需在 iPad 上确认。')
             elif kind == 'process_exit':
                 code = event['code']
+                if self.output_cleanup_running:
+                    self.output_cleanup_running = False
+                elif self.cleanup_after_child:
+                    self.cleanup_after_child = False
+                    self.begin_output_cleanup()
                 self.log(f'后端进程已退出（{code}）')
                 if self.auto_active:
                     self.auto_active = False
@@ -522,21 +544,39 @@ class PanelWindow(Adw.ApplicationWindow):
                     self.status.set_label('后端异常退出')
                     self.description.set_label('退出并不代表所有权限子进程已清理，请检查终端与系统授权状态。')
         self.update_controls()
-        if self.closing and not busy:
+        if self.closing and not busy and not self.controller.busy:
+            if not self.quit_cleanup_attempted and self.begin_output_cleanup():
+                return GLib.SOURCE_CONTINUE
             self.finish_quit()
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
+
+    def begin_output_cleanup(self):
+        if self.owned_output is None or self.output_cleanup_running:
+            return False
+        if self.closing:
+            self.quit_cleanup_attempted = True
+        try:
+            self.controller.cleanup_output(self.owned_output)
+        except (OSError, RuntimeError) as exc:
+            self.log(f'无法启动 VKMS 清理：{exc}')
+            return False
+        self.output_cleanup_running = True
+        self.log('正在关闭本程序启用的 VKMS 输出…')
+        return True
 
     def request_quit(self):
         if self.closing:
             return
         self.closing = True
+        self.quit_cleanup_attempted = self.output_cleanup_running
         if self.controller.busy:
-            self.present()
-            self.stop()
-        elif not self.auto_active:
+            if not self.output_cleanup_running:
+                self.stop()
+            return
+        # Drain pending output ownership/exit messages in poll before leaving.
+        if self.poll() == GLib.SOURCE_REMOVE:
             GLib.source_remove(self.timer)
-            self.finish_quit()
 
     def finish_quit(self):
         if self.tray is not None:
@@ -545,8 +585,8 @@ class PanelWindow(Adw.ApplicationWindow):
         self.destroy()
 
     def on_close(self, *_):
-        if (not self.closing and self.auto_active and not self.controller.stop_requested
-                and self.tray.ready):
+        # Closing the window is not quitting while the tray can reopen it.
+        if not self.closing and self.tray is not None and self.tray.ready:
             self.set_visible(False)
         else:
             self.request_quit()

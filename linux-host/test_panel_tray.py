@@ -153,6 +153,13 @@ def exercise_gtk_lifecycle():
     assert not window.apply_output_button.get_sensitive()
 
     controller = window.controller
+    assert window.elevate.get_active()
+    window.tray._set_ready(True, '')
+    window.close()
+    assert not window.get_visible() and not window.closing and not controller.stop_requested
+    window.show_panel()
+    assert window.get_visible()
+    window.tray._set_ready(False, 'No host')
     with patch('panel.Gtk.AlertDialog') as alert, patch.object(controller, 'start_auto') as start:
         window.confirm_auto()
         alert.assert_not_called()
@@ -168,7 +175,7 @@ def exercise_gtk_lifecycle():
         window.confirm_auto()
         answer = dialog.choose.call_args.args[2]
         answer(dialog, None)
-        start.assert_called_once_with('2360x1640', '1.5', elevate=False)
+        start.assert_called_once_with('2360x1640', '1.5', elevate=True)
 
     controller.busy = True
     window.close()
@@ -197,6 +204,38 @@ def exercise_gtk_lifecycle():
     controller.mailbox.put({'event': 'cleanup', 'complete': True})
     controller.mailbox.put({'event': 'process_exit', 'code': 0})
     assert window.poll() == GLib.SOURCE_REMOVE and not app.get_windows()
+
+    # Manual streaming cleanup and idle explicit quit both wait for the owned output.
+    for quitting in (False, True):
+        app = PanelApplication()
+        app.set_application_id('io.github.wired_display.Cleanup' + ('Quit' if quitting else 'Stream'))
+        assert app.register(None)
+        window = PanelWindow(app, preview=False)
+        controller = window.controller
+        owned = {'event': 'output_owned', 'device': '/dev/dri/card0', 'connector': 54,
+                 'virtual_index': 1, 'identity': '/sys/devices/test/card0-Virtual-1'}
+        controller.mailbox.put(owned)
+        def launch_cleanup(_):
+            controller.busy = True
+        with patch.object(controller, 'cleanup_output', side_effect=launch_cleanup) as cleanup:
+            if quitting:
+                window.request_quit()
+            else:
+                window.cleanup_after_child = True
+                controller.mailbox.put({'event': 'process_exit', 'code': 1})
+                assert window.poll() == GLib.SOURCE_CONTINUE
+            cleanup.assert_called_once_with(owned)
+            assert app.get_windows() == [window]
+            controller.busy = False
+            controller.mailbox.put({'event': 'output_cleaned'})
+            controller.mailbox.put({'event': 'process_exit', 'code': 0})
+            if quitting:
+                GLib.source_remove(window.timer)
+            assert window.poll() == (GLib.SOURCE_REMOVE if quitting else GLib.SOURCE_CONTINUE)
+            assert window.owned_output is None
+            if not quitting:
+                window.request_quit()
+            assert not app.get_windows()
 
     for kwargs in ({'preview': True}, {'diagnostic_dir': Path('/unused-diagnostic')}):
         app = PanelApplication(**kwargs)

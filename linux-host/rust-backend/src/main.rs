@@ -6,6 +6,7 @@ mod mux;
 mod output;
 mod process;
 mod protocol;
+mod reader_broker;
 mod session;
 mod source;
 use anyhow::{Context, Result, bail, ensure};
@@ -304,12 +305,26 @@ async fn dispatch(args: &[String], stop: &Stop) -> Result<()> {
         let result = output::configure(&root, device, connector, mode, true, stop).await?;
         return report_output(&root, stop, result).await;
     }
+    if let [command, flag, device, connector, index, identity] = args
+        && command == "cleanup-output"
+        && flag == "--confirm"
+    {
+        output::OwnedOutput::from_parts(device, connector.parse()?, index.parse()?, identity)?
+            .disable(&root()?)
+            .await
+            .context("未能清理本程序启用的 VKMS 输出")?;
+        emit(json!({"event":"output_cleaned"}));
+        return Ok(());
+    }
     let (mode, settings, confirmed) = parse(args)?;
     let root = root()?;
     match mode.as_str() {
         "discover" => emit(inventory(&root, stop).await?),
         "create-output" => {
-            let result = output::ensure(&root, confirmed, stop).await?;
+            let result = output::ensure_mode(&root, confirmed, None, stop, |owned| {
+                emit(owned.notice());
+            })
+            .await?;
             report_output(&root, stop, result).await?;
         }
         "stream" => session::stream(&root, &settings, stop).await?,

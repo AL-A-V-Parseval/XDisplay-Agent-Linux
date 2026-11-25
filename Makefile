@@ -30,3 +30,4 @@ run: all
 test: all
 	$(CARGO) test --locked --all-features --manifest-path $(MANIFEST) --target-dir $(BUILD)
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B -m unittest discover -s $(HOST) -p 'test_panel*.py'
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B $(HOST)/test_reader_broker.py

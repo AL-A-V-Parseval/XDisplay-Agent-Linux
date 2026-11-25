@@ -114,6 +114,11 @@ class PanelController:
     def create_output(self):
         self.launch([str(ROOT / 'xdisplay-backend'), 'create-output', '--confirm'])
 
+    def cleanup_output(self, owned):
+        self.launch([str(ROOT / 'xdisplay-backend'), 'cleanup-output', '--confirm',
+                     owned['device'], str(owned['connector']), str(owned['virtual_index']),
+                     owned['identity']])
+
     def configure_output(self, device, connector, resolution, scale):
         if (not isinstance(device, str) or not re.fullmatch(r'/dev/dri/card[0-9]+', device)
                 or type(connector) is not int or not 0 < connector <= 0xffffffff

@@ -60,7 +60,7 @@ async fn failure(state: &mut watch::Receiver<State>) {
 }
 
 pub async fn stream(root: &Path, settings: &Settings, stop: &Stop) -> Result<()> {
-    stream_with_tunnel(root, settings, stop, None).await
+    stream_with_tunnel(root, settings, stop, None, None).await
 }
 
 pub async fn stream_with_tunnel(
@@ -68,6 +68,7 @@ pub async fn stream_with_tunnel(
     settings: &Settings,
     stop: &Stop,
     tunnel: Option<UnixStream>,
+    mut broker: Option<&mut crate::reader_broker::ReaderBroker>,
 ) -> Result<()> {
     emit(json!({"event":"phase","phase":"validating"}));
     let info = inventory(root, stop).await?;
@@ -114,11 +115,25 @@ pub async fn stream_with_tunnel(
             Some(tunnel) => tunnel,
             None => mux::connect(settings.device_id, stop).await?,
         };
-        drive_inner(tunnel, &mut source, first, settings, stop, root).await
+        drive_inner(
+            tunnel,
+            &mut source,
+            first,
+            settings,
+            stop,
+            root,
+            broker.as_deref_mut(),
+        )
+        .await
     }
     .await;
     emit(json!({"event":"phase","phase":"cleaning"}));
-    let cleanup = source.close().await;
+    let source_cleanup = source.close().await;
+    let broker_cleanup = match broker {
+        Some(broker) => broker.capture_closed().await,
+        None => Ok(()),
+    };
+    let cleanup = source_cleanup.and(broker_cleanup);
     emit(json!({"event":"cleanup","complete":cleanup.is_ok()}));
     cleanup.map_err(|error| SourceFailure(error))?;
     #[cfg(feature = "frame-diagnostics")]
@@ -202,7 +217,7 @@ async fn drive(
     settings: &Settings,
     stop: &Stop,
 ) -> Result<u32> {
-    drive_inner(tunnel, source, first, settings, stop, Path::new("")).await
+    drive_inner(tunnel, source, first, settings, stop, Path::new(""), None).await
 }
 
 async fn drive_inner(
@@ -212,6 +227,7 @@ async fn drive_inner(
     settings: &Settings,
     stop: &Stop,
     root: &Path,
+    broker: Option<&mut crate::reader_broker::ReaderBroker>,
 ) -> Result<u32> {
     let (mut reader, mut writer) = tunnel.into_split();
     let protocol = Arc::new(Mutex::new(Protocol::default()));
@@ -300,7 +316,10 @@ async fn drive_inner(
             emit(json!({"event":"phase","phase":"preparing"}));
             tokio::select! {
                 value = async {
-                    source.start(root, stop).await.map_err(source_failure)?;
+                    match broker {
+                        Some(broker) => source.start_brokered(root, stop, broker).await,
+                        None => source.start(root, stop).await,
+                    }.map_err(source_failure)?;
                     source.next(width, height, Duration::from_secs(65), stop).await.map_err(source_failure)
                 } => value?,
                 _ = failure(&mut state) => { check(&state, stop)?; bail!("receiver stopped"); },
@@ -637,7 +656,16 @@ mod tests {
             peer_stop.request();
             images
         });
-        let result = drive_inner(host, &mut source, Vec::new(), &settings, &stop, &fixture.0).await;
+        let result = drive_inner(
+            host,
+            &mut source,
+            Vec::new(),
+            &settings,
+            &stop,
+            &fixture.0,
+            None,
+        )
+        .await;
         source.close().await.unwrap();
         assert_eq!(remote.await.unwrap().len(), 306);
         assert!(source.encoded >= 306);

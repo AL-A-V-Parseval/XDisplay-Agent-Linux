@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <linux/dma-buf.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,12 +123,12 @@ static int add_cursor(int fd, uint32_t crtc_id, unsigned char *pixels,
     return result;
 }
 
-static int emit(const void *data, size_t n) {
+static int emit(int output_fd, const void *data, size_t n) {
     const unsigned char *p = data;
     while (n) {
-        struct pollfd pollfd = {STDOUT_FILENO, POLLOUT, 0};
+        struct pollfd pollfd = {output_fd, POLLOUT, 0};
         if (poll(&pollfd, 1, 5000) <= 0 || !(pollfd.revents & POLLOUT)) return -1;
-        ssize_t wrote = write(STDOUT_FILENO, p, n);
+        ssize_t wrote = write(output_fd, p, n);
         if (wrote < 0 && (errno == EAGAIN || errno == EINTR)) continue;
         if (wrote <= 0) return -1;
         p += wrote; n -= (size_t)wrote;
@@ -143,7 +144,7 @@ struct private_frame {
 };
 
 static int get_frame(int fd, uint32_t connector_id, struct private_frame *buffer,
-                     struct raw_slot *slot, uint32_t stage_frame) {
+                     struct raw_slot *slot, uint32_t stage_frame, int output_fd) {
     struct cursor_stage stage = {0};
 #ifdef ENABLE_CURSOR_STAGE_PROBE
     uint8_t before[STAGE_ROI_W * STAGE_ROI_H];
@@ -209,7 +210,8 @@ static int get_frame(int fd, uint32_t connector_id, struct private_frame *buffer
     le32(header + 12, fb->width * fb->height * 4);
     if (slot) {
         if (raw_slot_publish(slot, STDOUT_FILENO)) goto cleanup;
-    } else if (emit(header, sizeof(header)) || emit(pixels, (size_t)fb->width * fb->height * 4)) goto cleanup;
+    } else if (emit(output_fd, header, sizeof(header)) ||
+               emit(output_fd, pixels, (size_t)fb->width * fb->height * 4)) goto cleanup;
 #ifdef ENABLE_CURSOR_STAGE_PROBE
     if (stage_frame) {
         int32_t post[2];
@@ -226,7 +228,7 @@ static int get_frame(int fd, uint32_t connector_id, struct private_frame *buffer
         };
         unsigned char record[4 + 4 * CURSOR_STAGE_WORDS] = {'C', 'S', 'T', '2'};
         for (size_t j = 0; j < CURSOR_STAGE_WORDS; j++) le32(record + 4 + j * 4, words[j]);
-        if (emit(record, sizeof(record))) goto cleanup;
+        if (emit(output_fd, record, sizeof(record))) goto cleanup;
     }
 #endif
     result = 0;
@@ -243,6 +245,97 @@ cleanup:
     if (c) drmModeFreeConnector(c);
     return result;
 }
+static int unnamed_socket(int fd, int expected) {
+    int type;
+    socklen_t len = sizeof type;
+    struct sockaddr_un local, peer;
+    socklen_t local_len = sizeof local, peer_len = sizeof peer;
+    return !getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) && type == expected &&
+        !getsockname(fd, (struct sockaddr *)&local, &local_len) && local.sun_family == AF_UNIX &&
+        !getpeername(fd, (struct sockaddr *)&peer, &peer_len) && peer.sun_family == AF_UNIX &&
+        local_len == offsetof(struct sockaddr_un, sun_path) &&
+        peer_len == offsetof(struct sockaddr_un, sun_path);
+}
+
+static int open_vkms(const char *path) {
+    int fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    struct stat st;
+    drmVersionPtr ver = drmGetVersion(fd);
+    int valid = !fstat(fd, &st) && S_ISCHR(st.st_mode) && ver && ver->name_len == 4 && !memcmp(ver->name, "vkms", 4);
+    if (ver) drmFreeVersion(ver);
+    if (!valid || drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) ||
+        drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static uint32_t read_le32(const unsigned char *v) {
+    return (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+}
+
+/* One inherited control channel; no listener, paths, or executable commands.
+ * An individual socket owns all capture resources. Its EOF returns us to idle. */
+static int broker(void) {
+    const int control = STDOUT_FILENO;
+    struct ucred controller;
+    socklen_t len = sizeof controller;
+    if (!unnamed_socket(control, SOCK_SEQPACKET) ||
+        getsockopt(control, SOL_SOCKET, SO_PEERCRED, &controller, &len) || controller.uid == 0) return 2;
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR || send(control, "R", 1, MSG_NOSIGNAL) != 1) return 2;
+    for (;;) {
+        struct pollfd idle = {control, POLLIN, 0};
+        if (poll(&idle, 1, 600000) <= 0) return 0;
+        unsigned char args[8];
+        struct iovec iov = {args, sizeof args};
+        union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1,
+                            .msg_control = ancillary.bytes, .msg_controllen = sizeof ancillary.bytes};
+        ssize_t n = recvmsg(control, &msg, MSG_CMSG_CLOEXEC);
+        if (!n && !CMSG_FIRSTHDR(&msg)) return 0;
+        struct cmsghdr *h = CMSG_FIRSTHDR(&msg);
+        /* On malformed input exit: the kernel closes every received descriptor. */
+        if (n != sizeof args || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || !h ||
+            h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS ||
+            h->cmsg_len != CMSG_LEN(sizeof(int)) || CMSG_NXTHDR(&msg, h)) return 2;
+        int data;
+        memcpy(&data, CMSG_DATA(h), sizeof data);
+        struct ucred peer;
+        len = sizeof peer;
+        if (!unnamed_socket(data, SOCK_STREAM) ||
+            getsockopt(data, SOL_SOCKET, SO_PEERCRED, &peer, &len) ||
+            peer.uid != controller.uid || peer.pid != controller.pid) return 2;
+        uint32_t connector = read_le32(args + 4);
+        char path[32];
+        snprintf(path, sizeof path, "/dev/dri/card%u", read_le32(args));
+        struct private_frame frame = {0};
+        alarm(15);
+        int fd = connector ? open_vkms(path) : -1;
+        if (fd >= 0) {
+            int flags = fcntl(data, F_GETFL);
+            if (flags >= 0 && !fcntl(data, F_SETFL, flags | O_NONBLOCK)) {
+                for (;;) {
+                    struct pollfd inputs[] = {{control, POLLIN, 0}, {data, POLLIN, 0}};
+                    unsigned char request;
+                    alarm(0);
+                    if (poll(inputs, 2, 12000) <= 0 || inputs[0].revents ||
+                        read(data, &request, 1) != 1 || request != 'F') break;
+                    alarm(15);
+                    if (get_frame(fd, connector, &frame, NULL, 0, data)) break;
+                }
+            }
+            close(fd);
+        }
+        alarm(15);
+        free(frame.pixels);
+        close(data);
+        if (send(control, "D", 1, MSG_NOSIGNAL) != 1) return 0;
+        alarm(0);
+    }
+}
+
 static uint32_t number(const char *s, uint32_t maximum) {
     if (!*s || strspn(s, "0123456789") != strlen(s)) return 0;
     errno = 0;
@@ -250,6 +343,7 @@ static uint32_t number(const char *s, uint32_t maximum) {
     return errno || !v || v > maximum ? 0 : (uint32_t)v;
 }
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--broker-v1")) return broker();
     int shared = argc == 5 && !strcmp(argv[4], "--shared-slot");
 #ifdef ENABLE_CURSOR_STAGE_PROBE
     int stage_probe = argc == 5 && !strcmp(argv[4], "--cursor-stage-probe");
@@ -266,30 +360,10 @@ int main(int argc, char **argv) {
     if (shared && !raw_slot_channel(STDOUT_FILENO)) {
         fprintf(stderr, "shared-slot requires private SOCK_SEQPACKET stdout\n"); return 2;
     }
-    if (continuous) {
-        int type;
-        socklen_t len = sizeof type;
-        struct sockaddr_un local, peer;
-        socklen_t local_len = sizeof local, peer_len = sizeof peer;
-        if (getsockopt(STDOUT_FILENO, SOL_SOCKET, SO_TYPE, &type, &len) || type != SOCK_STREAM ||
-            getsockname(STDOUT_FILENO, (struct sockaddr *)&local, &local_len) || local.sun_family != AF_UNIX ||
-            getpeername(STDOUT_FILENO, (struct sockaddr *)&peer, &peer_len) || peer.sun_family != AF_UNIX ||
-            local_len != offsetof(struct sockaddr_un, sun_path) ||
-            peer_len != offsetof(struct sockaddr_un, sun_path)) return 2;
-    }
+    if (continuous && !unnamed_socket(STDOUT_FILENO, SOCK_STREAM)) return 2;
     struct raw_slot slot = RAW_SLOT_INIT;
-    int fd = open(argv[1], O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) { perror("open VKMS"); return 1; }
-    struct stat st;
-    drmVersionPtr ver = drmGetVersion(fd);
-    int valid = !fstat(fd, &st) && S_ISCHR(st.st_mode) && ver && ver->name_len == 4 && !memcmp(ver->name, "vkms", 4);
-    if (ver) drmFreeVersion(ver);
-    if (!valid) { fprintf(stderr, "refusing non-VKMS device\n"); close(fd); return 1; }
-    /* Exposes atomic plane properties for queries on this fd only. No commit. */
-    if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) ||
-        drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
-        fprintf(stderr, "VKMS plane metadata unavailable\n"); close(fd); return 1;
-    }
+    int fd = open_vkms(argv[1]);
+    if (fd < 0) { fprintf(stderr, "cannot open validated VKMS device\n"); return 1; }
     int flags = fcntl(STDOUT_FILENO, F_GETFL);
     if (flags < 0 || fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK)) { close(fd); return 1; }
     if (!continuous) alarm(120); /* Existing bounded invocations retain the lifetime cap. */
@@ -310,7 +384,7 @@ int main(int argc, char **argv) {
         uint32_t frame = i + 1;
         if (continuous) alarm(12); /* A stalled request cannot pin the privileged helper. */
         /* Diagnostic mode writes a numeric sidecar, not an extra image copy. */
-        if (get_frame(fd, connector, &buffer, shared ? &slot : NULL, stage_probe ? frame : 0)) {
+        if (get_frame(fd, connector, &buffer, shared ? &slot : NULL, stage_probe ? frame : 0, STDOUT_FILENO)) {
             fprintf(stderr, "VKMS read failed: missing active virtual output, access, or unsupported buffer (%s)\n", strerror(errno));
             result = 1; break;
         }

@@ -22,7 +22,21 @@ The build writes executable files only inside the checkout. Do not launch the pa
 2. Choose a virtual-output resolution and scale in the panel, then confirm automatic connection. The selected resolution must match the app's negotiated dimensions.
 3. Close the window to keep the session in the tray. Use the tray menu to reopen, pause, or quit. If the cable is unplugged, the backend releases its capture and encoding resources before waiting for reconnection.
 
-Manual mode can discover an existing VKMS output and run a bounded stream. The host rejects ambiguous USB or VKMS targets. It does not install a service or set up login autostart. Stopping the session does not unload VKMS or revert an output mode applied during the session.
+With a working tray host, closing the window hides it even when idle; use Quit in the tray menu or Ctrl+Q to exit. Without a tray host, closing the window exits normally. Temporary VKMS reader authorization is selected by default in the panel and can be turned off; Polkit authorization is still required when selected.
+
+Manual mode can discover an existing VKMS output and run a bounded stream. The panel disables a virtual output it enabled when streaming ends or on explicit exit. Automatic mode does the same before waiting to reconnect. Previously enabled outputs are not disabled; the kernel module is not unloaded, and the last active desktop display is protected. The host rejects ambiguous USB or VKMS targets and does not install a service or configure login autostart.
+
+## One authorization per automatic session
+
+Automatic mode with temporary reader authorization enabled requires the dedicated helper in a root-owned system directory. Build the project as your normal user, then install only this binary once:
+
+```sh
+make
+sudo install -d -o root -g root -m 0755 /usr/lib/xdisplay-agent-linux
+sudo install -o root -g root -m 0755 linux-host/vkms-read /usr/lib/xdisplay-agent-linux/vkms-read
+```
+
+After reopening the panel, start automatic connection. The first successful iPad handshake requests Polkit authorization; subsequent reconnections reuse the same helper. Disconnect closes DRM handles and releases frame buffers before output cleanup. Pausing, quitting, or ten minutes without a capture session ends the helper; the next connection may require authorization again. If VKMS is not loaded, loading it can require a separate authorization. Manual test mode still uses one reader per test. No password, reusable Polkit grant, or service is installed; the system copy is not setuid. Reinstall it when updating the helper.
 
 ## Scope and testing
 

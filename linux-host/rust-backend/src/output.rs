@@ -242,6 +242,12 @@ fn mode_matches(row: &Value, requested: DisplayMode, normal: bool) -> bool {
 struct CreationLock {
     _file: File,
 }
+impl Drop for CreationLock {
+    fn drop(&mut self) {
+        // Release even if a concurrent fork has temporarily inherited this CLOEXEC fd.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 impl CreationLock {
     fn acquire() -> Result<Self> {
         let uid = unsafe { libc::getuid() };
@@ -297,7 +303,6 @@ impl CreationLock {
             return Err(std::io::Error::last_os_error())
                 .context("另一个面板正在创建虚拟输出，或无法获取创建锁");
         }
-        // File's destructor closes the descriptor and releases flock.
         Ok(Self { _file: file })
     }
 }
@@ -319,10 +324,104 @@ fn changed(mut row: Value, value: bool) -> Value {
     row
 }
 
-/// Requires explicit confirmation. Existing active output metadata is returned
-/// unchanged except `changed=false`; no mode/scale/transform commands are sent.
-pub async fn ensure(root: &Path, confirmed: bool, stop: &Stop) -> Result<Value> {
-    ensure_mode(root, confirmed, None, stop).await
+#[derive(Debug)]
+pub struct OwnedOutput {
+    target: Value,
+    identity: PathBuf,
+}
+
+fn connector_identity(target: &Value) -> Result<PathBuf> {
+    let drm = Path::new(DRM_ROOT);
+    let name = verify_connector_name(target, drm)?;
+    let card = device_card(target["device"].as_str().context("缺少 DRM 节点")?)?;
+    Ok(fs::canonicalize(drm.join(format!("{card}-{name}")))?)
+}
+
+impl OwnedOutput {
+    pub fn from_parts(device: &str, connector: u32, index: u32, identity: &str) -> Result<Self> {
+        device_card(device)?;
+        ensure!(
+            connector != 0 && (1..=256).contains(&index),
+            "无效的 VKMS 连接器"
+        );
+        let identity = PathBuf::from(identity);
+        ensure!(identity.starts_with("/sys/devices"), "无效的 VKMS 路径");
+        Ok(Self {
+            target: json!({"device":device,"connector":connector,"virtual_index":index}),
+            identity,
+        })
+    }
+
+    pub fn notice(&self) -> Value {
+        json!({"event":"output_owned", "device":self.target["device"],
+            "connector":self.target["connector"], "virtual_index":self.target["virtual_index"],
+            "identity":self.identity})
+    }
+
+    /// Called with a fresh cancellation token so teardown still runs after Stop.
+    pub async fn disable(self, root: &Path) -> Result<()> {
+        let stop = Stop::default();
+        let _lock = CreationLock::acquire()?;
+        let same_target = |row: &Value| {
+            ["device", "connector", "virtual_index"]
+                .iter()
+                .all(|key| row[*key] == self.target[*key])
+        };
+        if !scan(root, &stop).await?.iter().any(same_target) {
+            ensure!(
+                !self.identity.try_exists()?,
+                "无法再验证本程序启用的 VKMS 输出"
+            );
+            return Ok(());
+        }
+        ensure!(
+            connector_identity(&self.target)? == self.identity,
+            "VKMS 连接器身份已改变"
+        );
+        let name = connector_name(&self.target)?;
+        let outputs = niri_outputs(&stop).await?;
+        if !outputs[&name]["current_mode"].is_u64() {
+            return Ok(());
+        }
+        ensure!(
+            has_other_active_output(&outputs, &name),
+            "拒绝关闭桌面上最后一个启用的显示器"
+        );
+        ensure!(
+            connector_identity(&self.target)? == self.identity,
+            "VKMS 连接器身份已改变"
+        );
+        let args = ["msg".into(), "output".into(), name.clone(), "off".into()];
+        command(Path::new(NIRI), &args, Duration::from_secs(3), &stop).await?;
+        for _ in 0..POLL_COUNT {
+            if !niri_outputs(&stop).await?[&name]["current_mode"].is_u64() {
+                return Ok(());
+            }
+            observation_delay(&stop).await?;
+        }
+        bail!("未确认本程序启用的 VKMS 输出已关闭")
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cleanup_requires_another_enabled_desktop_output() {
+    let virtual_only = json!({"Virtual-1":{"current_mode":0,"logical":{}},
+                              "eDP-1":{"current_mode":null,"logical":null}});
+    assert!(!has_other_active_output(&virtual_only, "Virtual-1"));
+    let mut both = virtual_only;
+    both["eDP-1"] = json!({"current_mode": 0, "logical": {}});
+    assert!(has_other_active_output(&both, "Virtual-1"));
+    assert!(OwnedOutput::from_parts("/dev/dri/card0", 0, 1, "/sys/devices/test").is_err());
+    assert!(OwnedOutput::from_parts("/dev/dri/card0", 1, 1, "/tmp/test").is_err());
+}
+
+fn has_other_active_output(outputs: &Value, name: &str) -> bool {
+    outputs.as_object().is_some_and(|rows| {
+        rows.iter().any(|(key, row)| {
+            key != name && row["current_mode"].is_u64() && row["logical"].is_object()
+        })
+    })
 }
 
 pub async fn ensure_mode(
@@ -330,6 +429,7 @@ pub async fn ensure_mode(
     confirmed: bool,
     mode: Option<DisplayMode>,
     stop: &Stop,
+    on_owned: impl FnOnce(OwnedOutput),
 ) -> Result<Value> {
     ensure!(confirmed, "必须先明确确认 VKMS 创建操作");
     stop.check()?;
@@ -353,7 +453,8 @@ pub async fn ensure_mode(
     }
     // Fail before requesting privilege if ordinary-user compositor IPC fails.
     niri_outputs(stop).await?;
-    if rows.is_empty() && !Path::new("/sys/module/vkms").try_exists()? {
+    let loaded_here = rows.is_empty() && !Path::new("/sys/module/vkms").try_exists()?;
+    if loaded_here {
         phase("请在系统授权窗口允许加载 VKMS；面板不会以 root 运行…");
         let args = ["/usr/bin/modprobe", "vkms", "enable_cursor=1"].map(str::to_owned);
         command(
@@ -384,6 +485,15 @@ pub async fn ensure_mode(
     }
     let target = selected
         .context("niri 尚未识别对应 VKMS 输出；模块若已加载会保留，请检查设备权限或重启会话")?;
+    let name = verify_connector_name(&target, Path::new(DRM_ROOT))?;
+    let outputs = niri_outputs(stop).await?;
+    ensure!(outputs.get(&name).is_some(), "VKMS 输出已消失");
+    if loaded_here || outputs[&name]["current_mode"].is_null() {
+        on_owned(OwnedOutput {
+            identity: connector_identity(&target)?,
+            target: target.clone(),
+        });
+    }
     apply_mode(
         root,
         &target,
@@ -488,9 +598,15 @@ mod tests {
     use super::*;
     #[tokio::test(flavor = "current_thread")]
     async fn confirmation_is_required_before_any_io() {
-        let error = ensure(Path::new("/does-not-exist"), false, &Stop::default())
-            .await
-            .unwrap_err();
+        let error = ensure_mode(
+            Path::new("/does-not-exist"),
+            false,
+            None,
+            &Stop::default(),
+            |_| panic!("no ownership without consent"),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.to_string(), "必须先明确确认 VKMS 创建操作");
     }
 

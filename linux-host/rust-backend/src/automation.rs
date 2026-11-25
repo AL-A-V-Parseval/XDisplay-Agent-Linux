@@ -59,6 +59,18 @@ fn warning(error: &anyhow::Error) {
 }
 
 pub async fn run(root: &Path, options: Options, stop: &Stop) -> Result<()> {
+    let mut broker = crate::reader_broker::ReaderBroker::default();
+    let result = supervise(root, options, stop, &mut broker).await;
+    broker.close().await.context("VKMS 授权助手未能正常退出")?;
+    result
+}
+
+async fn supervise(
+    root: &Path,
+    options: Options,
+    stop: &Stop,
+    broker: &mut crate::reader_broker::ReaderBroker,
+) -> Result<()> {
     let mut previous = "";
     loop {
         stop.check()?;
@@ -86,33 +98,65 @@ pub async fn run(root: &Path, options: Options, stop: &Stop) -> Result<()> {
         stop.check()?;
         phase("configuring");
         // Revalidate even on the same USB ID: the compositor or VKMS may have restarted.
-        let mut target = output::ensure_mode(root, true, Some(options.mode), stop).await?;
-        target["event"] = json!("output_ready");
-        emit(target.clone());
-        let settings = Settings {
-            device: target["device"]
-                .as_str()
-                .context("missing VKMS device")?
-                .into(),
-            connector: u32::try_from(target["connector"].as_u64().context("missing connector")?)?,
-            device_id: id,
-            transport: "socket".into(),
-            socket_reuse_staging: true,
-            socket_skip_expired_wait: true,
-            elevate: options.elevate,
-            continuous: true,
-            ..Settings::default()
-        };
-        settings.validate()?;
-        if let Err(error) = session::stream_with_tunnel(root, &settings, stop, Some(tunnel)).await {
-            if error.is::<crate::process::Cancelled>() || error.is::<session::SourceFailure>() {
-                return Err(error);
-            }
-            warning(&error);
+        let mut owned = None;
+        let result = connect_and_stream(root, &options, stop, id, tunnel, &mut owned, broker).await;
+        if let Some(owned) = owned {
+            phase("cleaning");
+            owned
+                .disable(root)
+                .await
+                .context("自动连接结束后未能清理 VKMS 输出")?;
+            emit(json!({"event":"output_cleaned"}));
+        }
+        match result? {
+            Some(error) => warning(&error),
+            None => {}
         }
         previous = "";
         delay(stop, 4).await?;
     }
+}
+
+async fn connect_and_stream(
+    root: &Path,
+    options: &Options,
+    stop: &Stop,
+    id: u32,
+    tunnel: tokio::net::UnixStream,
+    owned: &mut Option<output::OwnedOutput>,
+    broker: &mut crate::reader_broker::ReaderBroker,
+) -> Result<Option<anyhow::Error>> {
+    let mut target = output::ensure_mode(root, true, Some(options.mode), stop, |output| {
+        *owned = Some(output);
+    })
+    .await?;
+    target["event"] = json!("output_ready");
+    emit(target.clone());
+    let settings = Settings {
+        device: target["device"]
+            .as_str()
+            .context("missing VKMS device")?
+            .into(),
+        connector: u32::try_from(target["connector"].as_u64().context("missing connector")?)?,
+        device_id: id,
+        transport: "socket".into(),
+        socket_reuse_staging: true,
+        socket_skip_expired_wait: true,
+        elevate: options.elevate,
+        continuous: true,
+        ..Settings::default()
+    };
+    settings.validate()?;
+    let broker = options.elevate.then_some(broker);
+    if let Err(error) =
+        session::stream_with_tunnel(root, &settings, stop, Some(tunnel), broker).await
+    {
+        if error.is::<crate::process::Cancelled>() || error.is::<session::SourceFailure>() {
+            return Err(error);
+        }
+        return Ok(Some(error));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
