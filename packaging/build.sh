@@ -41,7 +41,9 @@ printf '%s\n' 'Package: xdisplay-agent-linux' "Version: $version" 'Architecture:
 dpkg-deb --root-owner-group --build "$deb" "$out/xdisplay-agent-linux_${version}_amd64.deb"
 
 mv "$app/xdisplay-agent-linux" "$app/AppRun"
-install -m644 "packaging/$id.desktop" "packaging/$id.svg" "$app/"
+install -m644 "packaging/$id.desktop" "$app/"
+rsvg-convert -w 128 -h 128 "packaging/$id.svg" -o "$app/$id.png"
+ln -s "$id.png" "$app/.DirIcon"
 ARCH=x86_64 "$APPIMAGETOOL" --no-appstream "$app" "$out/$name.AppImage"
 chmod +x "$out/$name.AppImage"
 

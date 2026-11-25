@@ -15,7 +15,7 @@ jobs:
       - name: Install build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libdrm-dev libturbojpeg0-dev python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 dbus-daemon xvfb xauth squashfs-tools desktop-file-utils
+          sudo apt-get install -y --no-install-recommends libdrm-dev libturbojpeg0-dev python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 dbus-daemon xvfb xauth squashfs-tools desktop-file-utils librsvg2-bin
           rustup update stable --no-self-update
           rustup override set stable
       - name: Build and test
