@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=XDisplay Agent Linux
+Comment=Use an iPad as a wired second display
+Exec=xdisplay-agent-linux
+Icon=io.github.wired_display.ControlPanel
+Terminal=false
+Categories=Utility;

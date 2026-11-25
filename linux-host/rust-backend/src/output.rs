@@ -456,7 +456,11 @@ pub async fn ensure_mode(
     let loaded_here = rows.is_empty() && !Path::new("/sys/module/vkms").try_exists()?;
     if loaded_here {
         phase("请在系统授权窗口允许加载 VKMS；面板不会以 root 运行…");
-        let args = ["/usr/bin/modprobe", "vkms", "enable_cursor=1"].map(str::to_owned);
+        let modprobe = ["/usr/sbin/modprobe", "/usr/bin/modprobe"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .context("未找到 modprobe，请安装 kmod")?;
+        let args = [modprobe, "vkms", "enable_cursor=1"].map(str::to_owned);
         command(
             Path::new("/usr/bin/pkexec"),
             &args,

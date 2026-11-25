@@ -18,9 +18,9 @@ use tokio::{
     time::timeout,
 };
 
-const HELPER: &str = "/usr/lib/xdisplay-agent-linux/vkms-read";
+pub(crate) const HELPER: &str = "/usr/lib/xdisplay-agent-linux/vkms-read";
 
-fn validate_install(path: &Path) -> Result<()> {
+pub(crate) fn validate_install(path: &Path) -> Result<()> {
     for (index, component) in path.ancestors().enumerate() {
         let meta = fs::symlink_metadata(component)
             .context("请先将专用 VKMS 读取器安装到系统目录（见 README）")?;

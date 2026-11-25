@@ -161,8 +161,13 @@ impl Source {
             helper_path
         };
         let mut command = if self.settings.elevate {
+            // Do not elevate a helper under an editable checkout or AppImage mount.
+            #[cfg(feature = "frame-diagnostics")]
+            ensure!(self.diagnostic.is_none(), "独立诊断读取器不支持提权");
+            let helper = Path::new(crate::reader_broker::HELPER);
+            crate::reader_broker::validate_install(helper)?;
             let mut cmd = Command::new("/usr/bin/pkexec");
-            cmd.arg(&helper_path);
+            cmd.arg(helper);
             cmd
         } else {
             Command::new(&helper_path)

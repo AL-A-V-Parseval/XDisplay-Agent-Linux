@@ -9,6 +9,16 @@ A Linux host for using an iPad as a **wired, independent second display** with t
 - To build: a current stable Rust toolchain with Cargo (tested with Rust 1.100), Make, a C compiler, `pkg-config`, and the development headers for libdrm and libturbojpeg.
 - An iPad with the official Wired XDisplay app and a data-capable cable. Only connect one candidate USB device at a time. A graphical Polkit agent is needed if a VKMS operation requires temporary authorization.
 
+## Release downloads (Linux x86_64)
+
+Download from [GitHub Releases](https://github.com/AL-A-V-Parseval/XDisplay-Agent-Linux/releases). These builds target Ubuntu 24.04 or compatible systems with glibc 2.39+; niri, VKMS and a running usbmuxd are still required.
+
+- **`.deb`**: install with `sudo apt install ./xdisplay-agent-linux_0.1.0_amd64.deb`, then launch `xdisplay-agent-linux` or use the application menu. This also installs the system reader.
+- **`.tar.gz`**: unpack it and run `./xdisplay-agent-linux` from the extracted directory.
+- **`.AppImage`**: `chmod +x XDisplay-Agent-Linux-*.AppImage`, then run the downloaded file. If FUSE is unavailable, pass `--appimage-extract-and-run`.
+
+The archive and AppImage use system Python/PyGObject, GTK/libadwaita, libdrm and libturbojpeg. On Ubuntu 24.04, install `python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 libdrm2 libturbojpeg0 pkexec kmod usbmuxd` with `apt`. Use `--check-runtime` to check the GUI and native dependencies without accessing hardware. When using temporary authorization, install the reader from the matching tar archive as described below; the portable formats do not install privileged components automatically.
+
 ## Build and run
 
 ```sh
@@ -28,7 +38,7 @@ Manual mode can discover an existing VKMS output and run a bounded stream. The p
 
 ## One authorization per automatic session
 
-Automatic mode with temporary reader authorization enabled requires the dedicated helper in a root-owned system directory. Build the project as your normal user, then install only this binary once:
+Temporary reader authorization requires the dedicated helper in a root-owned system directory. The `.deb` already installs it. Otherwise, build as a normal user or extract the matching tar archive, then install only this binary once:
 
 ```sh
 make

@@ -1,4 +1,5 @@
 # Local builds
+/dist/
 /target/
 /linux-host/rust-backend/target/
 /linux-host/xdisplay-backend
